@@ -1,5 +1,9 @@
+import { logger, stream } from './utils/logger';
+import * as sourceMaps from 'source-map-support'
+sourceMaps.install()
+
 import { BoxRequestNsqMessage } from './models/boxMessages';
-import { Reader } from 'nsqjs'
+import { Reader, Writer } from 'nsqjs'
 const BoxSDK = require('box-node-sdk')
 const sdkConfig = require('./appSetting.json')
 
@@ -16,20 +20,32 @@ class SDKConfiguration {
 class NsqClient {
     constructor(sdkConfiguration: SDKConfiguration) {
         this.client = sdkConfiguration.sdk.getAppAuthClient('user', '10749870381')
-        console.log('nsq client created')
+        this.writerIsConnected = false
+        logger.debug('nsq client created')
     }
     client: any
-    reader = new Reader('box', 'actions', {
+    reader = new Reader('box-request', 'actions', {
         lookupdHTTPAddresses: "nsqlookupd:4161",//"172.18.0.2:4161", // 
         nsqdTCPAddresses: "nsqd:4150",//['172.18.0.4:4150'] //
         maxInFlight: 8,
         maxAttempts: 3
     })
-    connect = (): void => {
+    writer = new Writer('nsqd', 4150)
+    writerIsConnected: boolean
+    connectWriter = (): void => {
+        this.writer.connect()
+        logger.debug('file upload-response writer connected')
+        this.writerIsConnected = true
+        this.writer.on('ready', () => {
+        })
+        this.writer.on('error', () => this.writerIsConnected = false)
+        this.writer.on('closed', () => this.writerIsConnected = false)
+    }
+    connectReader = (): void => {
         this.reader.connect()
-        console.log('file upload topic connected')
+        logger.debug('file upload reader connected')
         this.reader.on('message', async msg => {
-            console.log(`received a message ${msg.id}`)
+            // console.log(`received a message ${msg.id}`)
 
             let body = JSON.parse(msg.body.toString())
 // todo -> change interface to the class with validation in the constructor
@@ -46,16 +62,25 @@ class NsqClient {
             // validate input
             // wrong input -> delete from queue
 
-            if (receivedBoxMessge.boxAction.toLowerCase() === 'upload') {
-                console.log('action is upload')
-            }
+            // if (receivedBoxMessge.boxAction.toLowerCase() === 'upload') {
+            //     console.log('action is upload')
+            // }
 
             try {
+                let uploadStart = Date.now()
                 await this.client.files
                     .uploadFile(receivedBoxMessge.targetFolder, `${receivedBoxMessge.fileToUploadName} ${new Date()}${Math.random().toString()}.${receivedBoxMessge.fileToUploadType}`, Buffer.from(receivedBoxMessge.fileToUpload))
-                msg.finish()
+                    logger.debug(`raw uploading time: ${Date.now() - uploadStart}`)
+                    // check if writer is ready to send response
+                // if (this.writerIsConnected===true) {
+                    this.writer.publish('box-response', { requestId:  receivedBoxMessge.reqestId})
+                    msg.finish()
+                // } else {
+                //     msg.requeue(30)
+                //     console.log(`writer is not ready to send resposne. requeueing messgae`)
+                // }
             } catch (error) {
-                console.log(error)
+                logger.error(error)
                 msg.requeue(30)
             }
         })
