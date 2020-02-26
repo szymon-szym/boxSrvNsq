@@ -1,40 +1,30 @@
+import { uploadFile } from './service/boxUtils';
 import { logger, stream } from './utils/logger';
 import * as sourceMaps from 'source-map-support'
 sourceMaps.install()
 
-import { BoxRequestNsqMessage } from './models/boxMessages';
+import SDKConfiguration from './service/boxInit';
 import { Reader, Writer } from 'nsqjs'
-const BoxSDK = require('box-node-sdk')
-const sdkConfig = require('./appSetting.json')
 
-
-
-
-class SDKConfiguration {
-    sdk = BoxSDK.getPreconfiguredInstance(sdkConfig)
-}
-
-// let tempSdk = new SDKConfiguration()
-// let tempClient = tempSdk.sdk.getAppAuthClient('user', '10749870381')
 
 class NsqClient {
     constructor(sdkConfiguration: SDKConfiguration) {
-        this.client = sdkConfiguration.sdk.getAppAuthClient('user', '10749870381')
+        this.client = sdkConfiguration.sdk.getAppAuthClient('user', process.env.BOX_UPLOAD_CLIENT_ID || '10749870381')
         this.writerIsConnected = false
         logger.debug('nsq client created')
     }
     client: any
-    reader = new Reader('box-request', 'actions', {
-        lookupdHTTPAddresses: "nsqlookupd:4161",//"172.18.0.2:4161", // 
-        nsqdTCPAddresses: "nsqd:4150",//['172.18.0.4:4150'] //
+    reader = new Reader('box.upload', 'actions', {
+        lookupdHTTPAddresses: process.env.NSQ_LOOKUP_ADRESS || "127.0.0.1:4161",//"172.18.0.2:4161", // 
+        nsqdTCPAddresses: process.env.NSQ_DAEMON_ADDRESS || "127.0.0.1:4150",//['172.18.0.4:4150'] //
         maxInFlight: 8,
         maxAttempts: 3
     })
-    writer = new Writer('nsqd', 4150)
+    writer = new Writer(process.env.NSQ_DAEMON_ADDRESS_WRITER || '127.0.0.1', 4150)
     writerIsConnected: boolean
     connectWriter = (): void => {
         this.writer.connect()
-        logger.debug('file upload-response writer connected')
+        logger.debug('nsq writer connected')
         this.writerIsConnected = true
         this.writer.on('ready', () => {
         })
@@ -45,43 +35,38 @@ class NsqClient {
         this.reader.connect()
         logger.debug('file upload reader connected')
         this.reader.on('message', async msg => {
-            // console.log(`received a message ${msg.id}`)
-
-            let body = JSON.parse(msg.body.toString())
-// todo -> change interface to the class with validation in the constructor
-            const receivedBoxMessge: BoxRequestNsqMessage = {
-                boxAction: body.boxAction.toLowerCase(),
-                fileToUpload: body.fileToUpload.data,
-                fileToUploadName: body.fileToUploadName,
-                fileToUploadType: body.fileToUploadType,
-                targetFolder: body.targetFolder,
-                reqestId:  body.reqestId,
-                processName: body.processName,
-            }
-            // check if incoming msg is expected model
-            // validate input
-            // wrong input -> delete from queue
-
-            // if (receivedBoxMessge.boxAction.toLowerCase() === 'upload') {
-            //     console.log('action is upload')
-            // }
-
             try {
-                let uploadStart = Date.now()
-                await this.client.files
-                    .uploadFile(receivedBoxMessge.targetFolder, `${receivedBoxMessge.fileToUploadName} ${new Date()}${Math.random().toString()}.${receivedBoxMessge.fileToUploadType}`, Buffer.from(receivedBoxMessge.fileToUpload))
-                    logger.debug(`raw uploading time: ${Date.now() - uploadStart}`)
-                    // check if writer is ready to send response
-                // if (this.writerIsConnected===true) {
-                    this.writer.publish('box-response', { requestId:  receivedBoxMessge.reqestId})
+                const { boxUploadData, id, user } = msg.json()
+
+                try {
+                    const uploadedId = await uploadFile(this.client, boxUploadData.targetFolder, boxUploadData.fileToUploadName, boxUploadData.fileToUploadType, Buffer.from(boxUploadData.fileToUpload))
+                    // if wasn't able to upload a file - requeue message
+                    // todo -> requeue only connection and rate limit errors
+                    if (uploadedId == "") {
+                        logger.error(`File not uploaded, requeueing`)
+                        msg.requeue(200)
+                    }
+                    logger.debug(`req: ${id} file uploaded`)
+
+                    // todo -> write a message to the notification service
+                    this.writer.publish('notification.confirmation', { uploadedFile: uploadedId, user: user })
+
                     msg.finish()
-                // } else {
-                //     msg.requeue(30)
-                //     console.log(`writer is not ready to send resposne. requeueing messgae`)
-                // }
+
+
+                } catch (error) {
+                    // on generic error just requeueu
+                    logger.error(`${error}`)
+                    msg.requeue(200)
+                }
             } catch (error) {
-                logger.error(error)
-                msg.requeue(30)
+                // if can't parse a message send na error notification
+                logger.error(`can't parse message from msg body: ${error}`)
+                // todo -> write a message to the notification service
+                this.writer.publish('notification.error', `to implement, ${error}`)
+
+                msg.finish()
+
             }
         })
         this.reader.on('error', err => console.error(err))
@@ -94,7 +79,3 @@ export const App = {
     nsqClient: NsqClient
 }
 
-
-// const client = sdk.getAppAuthClient('user', '10749870381')
-// client.folders.getItems('93875468756', { limit: 1})
-// .then((r: any) => console.log(r))
